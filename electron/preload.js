@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld("gcsBridge", {
   },
   launchQgc: () => ipcRenderer.invoke("qgc:launch"),
   selectMissionPlan: () => ipcRenderer.invoke("mission:select"),
+  createTrayLandingPlan: () => ipcRenderer.invoke("mission:tray-plan"),
   uploadMissionPlan: () => ipcRenderer.invoke("mission:upload"),
   startMissionPlan: () => ipcRenderer.invoke("mission:start"),
   minimizeWindow: () => ipcRenderer.send("window:minimize"),

@@ -13,6 +13,7 @@ os.environ.setdefault("ROS_LOG_DIR", os.path.join(BRIDGE_ROOT, ".ros-log"))
 os.makedirs(os.environ["ROS_LOG_DIR"], exist_ok=True)
 
 import rclpy
+from mavros_msgs.msg import RCOut
 from px4_msgs.msg import (
     ActuatorMotors,
     AirspeedValidated,
@@ -75,6 +76,8 @@ class Px4ElectronBridge(Node):
         super().__init__("arecada_electron_bridge")
 
         self.last_px4_message = 0.0
+        self.last_position_setpoint_message = 0.0
+        self.last_actuator_motors_message = 0.0
         self.commands = queue.Queue()
         self.state = {
             "flightMode": "WAITING FOR PX4",
@@ -93,6 +96,7 @@ class Px4ElectronBridge(Node):
             },
             "altitude": 0.0,
             "airspeed": 0.0,
+            "groundSpeed": 0.0,
             "throttle": 0.0,
             "battery": 0.0,
             "heading": 0.0,
@@ -114,6 +118,7 @@ class Px4ElectronBridge(Node):
                 "horizontalError": 0.0,
                 "verticalError": 0.0,
                 "globalPosition": [None, None, None],
+                "referencePosition": [None, None, None],
                 "deadReckoning": False,
                 "tiltAligned": False,
                 "yawAligned": False,
@@ -130,6 +135,14 @@ class Px4ElectronBridge(Node):
                 "valid": False,
             },
             "sourceTimestamps": {},
+            "simulation": {
+                "trayPosition": [
+                    # Gazebo ENU (X=east, Y=north) -> PX4 NED (X=north, Y=east)
+                    float(os.environ.get("TRAY_Y", "5.0")),
+                    float(os.environ.get("TRAY_X", "0.0")),
+                    float(os.environ.get("TRAY_Z", "0.04")),
+                ],
+            },
         }
 
         self.subscribe_compatible(
@@ -155,6 +168,12 @@ class Px4ElectronBridge(Node):
             "/fmu/out/actuator_motors",
             self.on_actuator_motors,
             PX4_QOS,
+        )
+        self.create_subscription(
+            RCOut,
+            "/mavros/rc/out",
+            self.on_mavros_rc_out,
+            10,
         )
         self.create_subscription(
             SensorGps,
@@ -272,6 +291,16 @@ class Px4ElectronBridge(Node):
             finite_or(message.vy),
             finite_or(message.vz),
         ]
+        self.state["groundSpeed"] = math.hypot(
+            finite_or(message.vx),
+            finite_or(message.vy),
+        )
+        if message.xy_global:
+            self.state["estimate"]["referencePosition"] = [
+                float(message.ref_lat),
+                float(message.ref_lon),
+                float(message.ref_alt) if message.z_global else None,
+            ]
 
     def on_airspeed(self, message):
         self.mark_px4_active()
@@ -285,6 +314,7 @@ class Px4ElectronBridge(Node):
 
     def on_actuator_motors(self, message):
         self.mark_px4_active()
+        self.last_actuator_motors_message = time.monotonic()
         self.state["sourceTimestamps"]["actuatorMotors"] = int(
             message.timestamp
         )
@@ -297,6 +327,24 @@ class Px4ElectronBridge(Node):
             sum(active_controls) / len(active_controls) * 100.0
             if active_controls
             else 0.0
+        )
+
+    def on_mavros_rc_out(self, message):
+        if time.monotonic() - self.last_actuator_motors_message < 1.0:
+            return
+
+        motor_outputs = [
+            float(value)
+            for value in list(message.channels)[:4]
+            if value > 0
+        ]
+        if not motor_outputs:
+            self.state["throttle"] = 0.0
+            return
+
+        self.state["throttle"] = max(
+            0.0,
+            min(100.0, sum(motor_outputs) / len(motor_outputs) / 10.0),
         )
 
     def on_gps(self, message):
@@ -385,6 +433,7 @@ class Px4ElectronBridge(Node):
 
     def on_local_position_setpoint(self, message):
         self.mark_px4_active()
+        self.last_position_setpoint_message = time.monotonic()
         self.state["sourceTimestamps"]["vehicleLocalPositionSetpoint"] = int(
             message.timestamp
         )
@@ -463,6 +512,10 @@ class Px4ElectronBridge(Node):
 
     def publish_state(self):
         connected = time.monotonic() - self.last_px4_message < 2.0
+        self.state["setpoint"]["valid"] = (
+            self.state["setpoint"]["valid"]
+            and time.monotonic() - self.last_position_setpoint_message < 1.0
+        )
         payload = {
             "type": "telemetry",
             "connected": connected,

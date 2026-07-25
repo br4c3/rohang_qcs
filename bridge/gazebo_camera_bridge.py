@@ -11,7 +11,7 @@ from gz.transport13 import Node
 from PIL import Image
 
 
-FRAME_INTERVAL = 1 / 12
+FRAME_INTERVAL = 1 / 5
 JPEG_QUALITY = 68
 CAMERA_TOPIC_SUFFIX = "/sensor/camera/image"
 
@@ -21,6 +21,29 @@ class CameraBridge:
         self.node = Node()
         self.last_frame_time = 0.0
         self.topic = None
+        self.detector = self.load_detector()
+
+    @staticmethod
+    def load_detector():
+        model_path = os.environ.get("TRAY_YOLO_MODEL")
+        if not model_path or not os.path.isfile(model_path):
+            print("YOLO disabled: model file not found", file=sys.stderr, flush=True)
+            return None
+
+        try:
+            from ultralytics import YOLO
+
+            detector = YOLO(model_path)
+            detector.model.names = {0: "트레이"}
+            print(
+                f"YOLO connected: {model_path} classes={detector.names}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return detector
+        except Exception as error:
+            print(f"YOLO load failed: {error}", file=sys.stderr, flush=True)
+            return None
 
     def find_camera_topic(self):
         configured_topic = os.environ.get("GZ_CAMERA_TOPIC")
@@ -59,6 +82,7 @@ class CameraBridge:
         if frame is None:
             return
 
+        frame = self.annotate_detections(frame)
         output = io.BytesIO()
         frame.save(
             output,
@@ -71,6 +95,31 @@ class CameraBridge:
         sys.stdout.buffer.write(struct.pack(">I", len(jpeg)))
         sys.stdout.buffer.write(jpeg)
         sys.stdout.buffer.flush()
+
+    def annotate_detections(self, frame):
+        if self.detector is None:
+            return frame
+
+        try:
+            import numpy as np
+
+            result = self.detector.predict(
+                source=np.asarray(frame),
+                conf=float(os.environ.get("TRAY_YOLO_CONFIDENCE", "0.25")),
+                imgsz=640,
+                device="cpu",
+                verbose=False,
+            )[0]
+            annotated_bgr = result.plot(
+                labels=True,
+                conf=True,
+                line_width=2,
+            )
+            return Image.fromarray(annotated_bgr[:, :, ::-1])
+        except Exception as error:
+            print(f"YOLO inference failed: {error}", file=sys.stderr, flush=True)
+            self.detector = None
+            return frame
 
     @staticmethod
     def decode_frame(message):

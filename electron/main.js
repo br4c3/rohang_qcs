@@ -40,10 +40,12 @@ let qgcProcess;
 let mavrosProcess;
 let missionProcess;
 let selectedPlanPath;
+let selectedTrayLandingTarget;
 let qgcCaptureTimer;
 let qgcCaptureBusy = false;
 let qgcCaptureReady = false;
 let qgcCaptureSourcesLogged = false;
+let lastTelemetry;
 
 function resolveRequestPath(requestUrl) {
   const url = new URL(requestUrl, "http://127.0.0.1");
@@ -207,6 +209,7 @@ function startRosBridge() {
     for (const line of lines) {
       try {
         const message = JSON.parse(line);
+        lastTelemetry = message;
         BrowserWindow.getAllWindows().forEach((window) => {
           window.webContents.send("px4:telemetry", message);
         });
@@ -269,11 +272,24 @@ function startCameraBridge() {
     "bridge",
     "gazebo_camera_bridge.py",
   );
+  const virtualEnvironmentPython = path.join(
+    projectRoot,
+    ".venv",
+    "bin",
+    "python",
+  );
+  const cameraPython = fs.existsSync(virtualEnvironmentPython)
+    ? virtualEnvironmentPython
+    : "python3";
 
-  cameraBridge = spawn("python3", [bridgePath], {
+  cameraBridge = spawn(cameraPython, [bridgePath], {
     cwd: projectRoot,
     stdio: ["ignore", "pipe", "pipe"],
-    env: process.env,
+    env: {
+      ...process.env,
+      MPLCONFIGDIR: path.join(projectRoot, ".generated", "matplotlib"),
+      TRAY_YOLO_MODEL: path.join(projectRoot, "best.pt"),
+    },
   });
 
   let frameBuffer = Buffer.alloc(0);
@@ -421,6 +437,96 @@ function startQgcCapture() {
 
 ipcMain.handle("qgc:launch", () => launchQGroundControl());
 
+function resolveTrayLandingTarget() {
+  const reference = lastTelemetry?.estimate?.referencePosition;
+  const tray = lastTelemetry?.simulation?.trayPosition || [5, 0, 0.04];
+  if (
+    !Array.isArray(reference)
+    || !Number.isFinite(reference[0])
+    || !Number.isFinite(reference[1])
+  ) {
+    throw new Error("PX4 로컬 위치 기준점을 아직 받지 못했습니다");
+  }
+
+  const earthRadius = 6378137;
+  return {
+    latitude: reference[0]
+      + (tray[0] / earthRadius) * (180 / Math.PI),
+    longitude: reference[1]
+      + (tray[1] / (
+        earthRadius * Math.cos(reference[0] * Math.PI / 180)
+      )) * (180 / Math.PI),
+    homeAltitude: Number.isFinite(reference[2]) ? reference[2] : 0,
+    reference,
+  };
+}
+
+function missionItem(command, sequence, latitude, longitude, altitude) {
+  return {
+    arecadaTrayLanding: true,
+    Altitude: altitude,
+    AltitudeMode: 1,
+    autoContinue: true,
+    command,
+    doJumpId: sequence,
+    frame: 3,
+    params: [0, 0, 0, null, latitude, longitude, altitude],
+    type: "SimpleItem",
+  };
+}
+
+function saveTrayLandingPlan(plan, target) {
+  const items = plan.mission?.items;
+  if (!Array.isArray(items)) {
+    throw new Error("QGC Plan에 미션 항목이 없습니다");
+  }
+
+  while (items.at(-1)?.arecadaTrayLanding) {
+    items.pop();
+  }
+  if (items.at(-1)?.command === 21) {
+    const landing = items.pop();
+    const lowApproach = items.at(-1);
+    const highApproach = items.at(-2);
+    const sameTarget = (item) => (
+      item?.command === 16
+      && item.params?.[4] === landing.params?.[4]
+      && item.params?.[5] === landing.params?.[5]
+    );
+    if (
+      sameTarget(lowApproach)
+      && sameTarget(highApproach)
+      && lowApproach.params?.[6] === 2
+      && highApproach.params?.[6] === 8
+    ) {
+      items.splice(-2);
+    }
+  }
+
+  const sequence = items.length + 1;
+  items.push(
+    missionItem(16, sequence, target.latitude, target.longitude, 8),
+    missionItem(16, sequence + 1, target.latitude, target.longitude, 2),
+    missionItem(21, sequence + 2, target.latitude, target.longitude, 0),
+  );
+  items.forEach((item, index) => {
+    item.doJumpId = index + 1;
+  });
+
+  const plansDirectory = path.join(projectRoot, "plans");
+  fs.mkdirSync(plansDirectory, { recursive: true });
+  selectedPlanPath = path.join(plansDirectory, "tray_landing.plan");
+  fs.writeFileSync(
+    selectedPlanPath,
+    `${JSON.stringify(plan, null, 2)}\n`,
+    "utf8",
+  );
+  selectedTrayLandingTarget = {
+    latitude: target.latitude,
+    longitude: target.longitude,
+  };
+}
+
 function runMissionAdapter(action, planPath) {
   return new Promise((resolve) => {
     if (missionProcess) {
@@ -445,7 +551,16 @@ function runMissionAdapter(action, planPath) {
       {
         cwd: projectRoot,
         stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
+        env: {
+          ...process.env,
+          ...(selectedTrayLandingTarget
+            ? {
+                ARECADA_TRAY_LANDING_TARGET: JSON.stringify(
+                  selectedTrayLandingTarget,
+                ),
+              }
+            : {}),
+        },
       },
     );
 
@@ -497,7 +612,57 @@ ipcMain.handle("mission:select", async () => {
     return { ok: false, canceled: true };
   }
 
-  selectedPlanPath = result.filePaths[0];
+  try {
+    const sourcePlan = JSON.parse(fs.readFileSync(result.filePaths[0], "utf8"));
+    const target = resolveTrayLandingTarget();
+    saveTrayLandingPlan(sourcePlan, target);
+    return runMissionAdapter("inspect", selectedPlanPath);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+});
+
+ipcMain.handle("mission:tray-plan", async () => {
+  let target;
+  try {
+    target = resolveTrayLandingTarget();
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message,
+    };
+  }
+
+  const plan = {
+    fileType: "Plan",
+    geoFence: { circles: [], polygons: [], version: 2 },
+    groundStation: "QGroundControl",
+    mission: {
+      cruiseSpeed: 3,
+      firmwareType: 12,
+      globalPlanAltitudeMode: 1,
+      hoverSpeed: 2,
+      items: [
+        missionItem(
+          22,
+          1,
+          target.reference[0],
+          target.reference[1],
+          8,
+        ),
+      ],
+      plannedHomePosition: [
+        target.reference[0],
+        target.reference[1],
+        target.homeAltitude,
+      ],
+      vehicleType: 2,
+      version: 2,
+    },
+    rallyPoints: { points: [], version: 2 },
+    version: 1,
+  };
+  saveTrayLandingPlan(plan, target);
   return runMissionAdapter("inspect", selectedPlanPath);
 });
 

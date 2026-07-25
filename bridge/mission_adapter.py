@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import json
+import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,6 +28,56 @@ from mission.config import load_qgc_plan, validate_hover_plan
 SERVICE_TIMEOUT = 20.0
 CONNECTION_TIMEOUT = 20.0
 AUTO_MISSION_MODE = "AUTO.MISSION"
+EARTH_RADIUS_METERS = 6378137.0
+TRAY_LANDING_TOLERANCE_METERS = 0.75
+
+
+def horizontal_distance_meters(first, second):
+    latitude_scale = math.pi * EARTH_RADIUS_METERS / 180.0
+    mean_latitude = math.radians((first[0] + second[0]) / 2.0)
+    north = (first[0] - second[0]) * latitude_scale
+    east = (
+        (first[1] - second[1])
+        * latitude_scale
+        * math.cos(mean_latitude)
+    )
+    return math.hypot(north, east)
+
+
+def expected_tray_target():
+    encoded = os.environ.get("ARECADA_TRAY_LANDING_TARGET")
+    if not encoded:
+        return None
+
+    try:
+        target = json.loads(encoded)
+        latitude = float(target["latitude"])
+        longitude = float(target["longitude"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("트레이 착륙 목표 좌표 형식이 잘못되었습니다") from error
+
+    return latitude, longitude
+
+
+def validate_tray_landing(items, target):
+    if items[-1]["command"] != 21:
+        raise ValueError("트레이 미션의 마지막 항목은 LAND여야 합니다")
+
+    landing = (items[-1]["latitude"], items[-1]["longitude"])
+    approach = (items[-2]["latitude"], items[-2]["longitude"])
+    landing_error = horizontal_distance_meters(landing, target)
+    approach_error = horizontal_distance_meters(approach, target)
+
+    if landing_error > TRAY_LANDING_TOLERANCE_METERS:
+        raise ValueError(
+            f"LAND 지점이 트레이에서 {landing_error:.2f}m 벗어났습니다"
+        )
+    if approach_error > TRAY_LANDING_TOLERANCE_METERS:
+        raise ValueError(
+            f"최종 접근 지점이 트레이에서 {approach_error:.2f}m 벗어났습니다"
+        )
+    if items[-2]["altitude"] <= 0:
+        raise ValueError("트레이 최종 접근 고도는 0m보다 높아야 합니다")
 
 
 def emit(status, message, **payload):
@@ -40,7 +92,14 @@ def emit(status, message, **payload):
 
 def inspect_plan(plan_path):
     items, summary = load_qgc_plan(plan_path)
-    validate_hover_plan(items)
+    tray_target = expected_tray_target()
+    if items[-1]["command"] == 21:
+        if len(items) < 3:
+            raise ValueError("착륙 미션은 이륙·접근·착륙 항목이 필요합니다")
+        if tray_target is not None:
+            validate_tray_landing(items, tray_target)
+    else:
+        validate_hover_plan(items)
     resolved_path, item_count, start, end = summary
     waypoints = [
         {
@@ -54,7 +113,11 @@ def inspect_plan(plan_path):
     ]
     emit(
         "ready",
-        f"{item_count}개 웨이포인트 검증 완료",
+        (
+            f"트레이 착륙 경로 {item_count}개 항목 검증 완료"
+            if tray_target is not None
+            else f"{item_count}개 웨이포인트 검증 완료"
+        ),
         path=str(resolved_path),
         count=item_count,
         start=start,

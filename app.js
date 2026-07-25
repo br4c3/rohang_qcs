@@ -1,27 +1,40 @@
 const flightModes = ["MISSION", "OFFBOARD", "POSITION", "HOLD", "RETURN", "LAND", "TAKEOFF"];
+const flightModeLabels = {
+  MISSION: "미션",
+  OFFBOARD: "외부 제어",
+  POSITION: "위치 유지",
+  HOLD: "대기",
+  RETURN: "복귀",
+  LAND: "착륙",
+  TAKEOFF: "이륙",
+  MANUAL: "수동",
+  ALTITUDE: "고도 유지",
+  ACRO: "아크로",
+  STABILIZED: "안정화",
+};
+let currentFlightMode = "";
 let sitlConnected = false;
 let selectedPlanWaypoints = [];
 let lastSitlTelemetry = null;
 let previousQgcFrameUrl;
 let qgcMap;
 let qgcVehicleMarker;
+let qgcTrayMarker;
 let qgcMissionLayer;
 let qgcMissionKey = "";
 const sensorHistory = {
   accel: [],
   gyro: [],
-  actualPosition: [],
-  desiredPosition: [],
   rawGpsPosition: [],
   ekfGlobalPosition: [],
 };
 let lastEstimatorLogTime = 0;
 
 const telemetry = [
-  { id: "gps", title: "GPS SATELLITES", value: "—", unit: "SAT", footer: "PX4 VEHICLE GPS", icon: "gps" },
-  { id: "throttle", title: "MOTOR OUTPUT", value: "—", unit: "%", footer: "ACTUATOR_MOTORS CONTROL AVG", icon: "gauge" },
-  { id: "altitude", title: "ALTITUDE", value: "—", unit: "m", footer: "LOCAL POSITION", icon: "altitude" },
-  { id: "airspeed", title: "AIRSPEED", value: "—", unit: "m/s", footer: "PX4 AIRSPEED", icon: "wind" },
+  { id: "gps", title: "GPS 위성", value: "—", unit: "개", footer: "PX4 기체 GPS", icon: "gps" },
+  { id: "throttle", title: "모터 출력", value: "—", unit: "%", footer: "MAVROS 모터 출력 평균", icon: "gauge" },
+  { id: "altitude", title: "고도", value: "—", unit: "m", footer: "지역 위치 기준", icon: "altitude" },
+  { id: "airspeed", title: "지상속도", value: "—", unit: "m/s", footer: "PX4 NED 수평속도", icon: "wind" },
 ];
 
 const icons = {
@@ -64,6 +77,39 @@ function showToast(message) {
   toastTimer = setTimeout(() => toast.classList.remove("show"), 1800);
 }
 
+function showConfirm(message) {
+  const backdrop = document.querySelector("#confirmBackdrop");
+  const messageElement = document.querySelector("#confirmMessage");
+  const accept = document.querySelector("#confirmAccept");
+  const cancel = document.querySelector("#confirmCancel");
+  messageElement.textContent = message;
+  backdrop.hidden = false;
+  accept.focus();
+
+  return new Promise((resolve) => {
+    const finish = (result) => {
+      backdrop.hidden = true;
+      accept.removeEventListener("click", acceptDialog);
+      cancel.removeEventListener("click", cancelDialog);
+      backdrop.removeEventListener("click", clickBackdrop);
+      document.removeEventListener("keydown", pressEscape);
+      resolve(result);
+    };
+    const acceptDialog = () => finish(true);
+    const cancelDialog = () => finish(false);
+    const clickBackdrop = (event) => {
+      if (event.target === backdrop) finish(false);
+    };
+    const pressEscape = (event) => {
+      if (event.key === "Escape") finish(false);
+    };
+    accept.addEventListener("click", acceptDialog);
+    cancel.addEventListener("click", cancelDialog);
+    backdrop.addEventListener("click", clickBackdrop);
+    document.addEventListener("keydown", pressEscape);
+  });
+}
+
 function bindControls() {
   document.querySelector("#modeCard").addEventListener("click", () => {
     const display = document.querySelector("#flightMode");
@@ -71,7 +117,7 @@ function bindControls() {
       showToast("PX4 연결 후 비행 모드를 변경할 수 있습니다.");
       return;
     }
-    const nextIndex = (flightModes.indexOf(display.textContent) + 1) % flightModes.length;
+    const nextIndex = (flightModes.indexOf(currentFlightMode) + 1) % flightModes.length;
     const nextMode = flightModes[nextIndex];
 
     window.gcsBridge.sendCommand({ type: "flightMode", mode: nextMode });
@@ -90,7 +136,8 @@ function bindControls() {
     if (button.dataset.state !== "TRANSITION") {
       window.gcsBridge.sendCommand({ type: "vtolState", state: button.dataset.state });
     }
-    showToast(`VTOL 상태: ${button.dataset.state}`);
+    const stateLabels = { FW: "고정익", TRANSITION: "전환", MC: "멀티콥터" };
+    showToast(`VTOL 상태: ${stateLabels[button.dataset.state]}`);
   });
 
   document.querySelector(".view-tabs").addEventListener("click", (event) => {
@@ -107,6 +154,7 @@ function bindControls() {
 
   document.querySelector("#launchQgcButton").addEventListener("click", launchQGroundControl);
   document.querySelector("#selectPlanButton").addEventListener("click", selectMissionPlan);
+  document.querySelector("#trayPlanButton").addEventListener("click", createTrayLandingPlan);
   document.querySelector("#uploadPlanButton").addEventListener("click", uploadMissionPlan);
   document.querySelector("#startPlanButton").addEventListener("click", startMissionPlan);
   document.querySelector("#qgcMirrorToggle").addEventListener("click", toggleQgcMirror);
@@ -126,13 +174,13 @@ async function launchQGroundControl() {
 
   const button = document.querySelector("#launchQgcButton");
   button.disabled = true;
-  button.textContent = "STARTING...";
+  button.textContent = "시작 중...";
 
   const result = await window.gcsBridge.launchQgc();
 
   if (!result.ok) {
     button.disabled = false;
-    button.textContent = "RETRY QGROUNDCONTROL";
+    button.textContent = "QGroundControl 다시 시도";
     showToast(result.error);
   }
 }
@@ -144,15 +192,26 @@ function updateQgcStatus({ status, detail }) {
   const button = document.querySelector("#launchQgcButton");
   const running = status === "running";
 
-  statusLabel.textContent = status.toUpperCase();
-  detailLabel.textContent = detail;
+  const statusLabels = {
+    running: "실행 중",
+    starting: "시작 중",
+    stopped: "종료됨",
+    error: "오류",
+    standby: "대기 중",
+  };
+  const detailLabels = {
+    "Opening QGroundControl": "QGroundControl을 여는 중",
+    "QGroundControl closed": "QGroundControl이 종료됨",
+  };
+  statusLabel.textContent = statusLabels[status] || status;
+  detailLabel.textContent = detailLabels[detail] || detail;
   statusDot.classList.toggle("online", running);
   button.disabled = running || status === "starting";
   button.textContent = running
-    ? "QGC RUNNING"
+    ? "QGC 실행 중"
     : status === "starting"
-      ? "STARTING..."
-      : "OPEN QGROUNDCONTROL";
+      ? "시작 중..."
+      : "QGroundControl 열기";
 }
 
 function updateQgcFrame(frame) {
@@ -172,11 +231,12 @@ function toggleQgcMirror() {
   const mapView = document.querySelector(".map-view");
   const button = document.querySelector("#qgcMirrorToggle");
   const active = mapView.classList.toggle("mirror-active");
-  button.textContent = active ? "SHOW PLAN MAP" : "SHOW QGC LIVE";
+  button.textContent = active ? "계획 지도 보기" : "QGC 실시간 보기";
 }
 
 function setPlanBusy(busy) {
   document.querySelector("#selectPlanButton").disabled = busy;
+  document.querySelector("#trayPlanButton").disabled = busy;
   document.querySelector("#uploadPlanButton").disabled = busy || selectedPlanWaypoints.length === 0;
   document.querySelector("#startPlanButton").disabled = busy || selectedPlanWaypoints.length === 0;
 }
@@ -207,9 +267,9 @@ function updatePlanStatus({ status, message }) {
 function applySelectedPlan(plan) {
   selectedPlanWaypoints = plan.waypoints.map((waypoint) => ({
     ...waypoint,
-    label: `WP ${waypoint.sequence}`,
+    label: `경유점 ${waypoint.sequence}`,
   }));
-  document.querySelector("#planCount").textContent = `${plan.count} WP`;
+  document.querySelector("#planCount").textContent = `경유점 ${plan.count}개`;
   document.querySelector("#planFileName").textContent = plan.path.split("/").pop();
   updatePlanStatus(plan);
   setPlanBusy(false);
@@ -235,6 +295,17 @@ async function selectMissionPlan() {
   applySelectedPlan(response.result);
 }
 
+async function createTrayLandingPlan() {
+  setPlanBusy(true);
+  const response = await window.gcsBridge.createTrayLandingPlan();
+  if (!response.ok) {
+    updatePlanStatus({ status: "error", message: response.error });
+    return;
+  }
+  applySelectedPlan(response.result);
+  showToast("트레이 착륙 계획을 생성했습니다.");
+}
+
 async function uploadMissionPlan() {
   setPlanBusy(true);
   const response = await window.gcsBridge.uploadMissionPlan();
@@ -245,7 +316,7 @@ async function uploadMissionPlan() {
 
 async function startMissionPlan() {
   setPlanBusy(true);
-  const confirmed = window.confirm(
+  const confirmed = await showConfirm(
     "선택한 미션으로 기체를 ARM하고 AUTO.MISSION을 시작할까요?",
   );
   if (!confirmed) {
@@ -273,7 +344,7 @@ function showPlanMap() {
 
   const mapView = document.querySelector(".map-view");
   mapView.classList.remove("mirror-active");
-  document.querySelector("#qgcMirrorToggle").textContent = "SHOW QGC LIVE";
+  document.querySelector("#qgcMirrorToggle").textContent = "QGC 실시간 보기";
   setTimeout(() => qgcMap?.invalidateSize(), 50);
 }
 
@@ -295,10 +366,11 @@ function updateSitlTelemetry(data) {
   const connection = document.querySelector(".connection-pill");
   const connectionLabel = document.querySelector("#connectionLabel");
   connection.classList.toggle("sitl", sitlConnected);
-  connectionLabel.textContent = sitlConnected ? "SITL ONLINE" : "DEMO LINK";
+  connectionLabel.textContent = sitlConnected ? "SITL 연결됨" : "연결 대기";
 
   if (!sitlConnected) {
-    document.querySelector("#flightMode").textContent = "PX4 OFFLINE";
+    currentFlightMode = "";
+    document.querySelector("#flightMode").textContent = "PX4 오프라인";
     ["gps", "throttle", "altitude", "airspeed"].forEach((id) => {
       document.querySelector(`#${id}Value`).textContent = "—";
     });
@@ -308,17 +380,19 @@ function updateSitlTelemetry(data) {
   }
 
   const altitude = Number(data.altitude || 0);
-  const airspeed = Number(data.airspeed || 0);
+  const groundSpeed = Number(data.groundSpeed || 0);
   const throttle = Number(data.throttle || 0);
   const gpsSatellites = Number(data.gpsSatellites || 0);
 
-  document.querySelector("#flightMode").textContent = data.flightMode;
+  currentFlightMode = data.flightMode;
+  document.querySelector("#flightMode").textContent =
+    flightModeLabels[data.flightMode] || data.flightMode;
   document.querySelector("#altitudeValue").textContent = altitude.toFixed(1);
-  document.querySelector("#airspeedValue").textContent = airspeed.toFixed(1);
+  document.querySelector("#airspeedValue").textContent = groundSpeed.toFixed(1);
   document.querySelector("#throttleValue").textContent = Math.round(throttle);
   document.querySelector("#gpsValue").textContent = gpsSatellites;
   document.querySelector("#hudAltitude").textContent = altitude.toFixed(1);
-  document.querySelector("#hudSpeed").textContent = airspeed.toFixed(1);
+  document.querySelector("#hudSpeed").textContent = groundSpeed.toFixed(1);
 
   document.querySelectorAll("#vtolControl button").forEach((button) => {
     button.classList.toggle("active", button.dataset.state === data.vtolState);
@@ -348,16 +422,12 @@ function updateSensorDisplay(data) {
   };
   Object.entries(attitudeValues).forEach(([axis, value]) => {
     document.querySelector(`#estimate${axis}`).textContent = `${value.toFixed(3)}°`;
-    const normalized = axis === "Yaw"
-      ? value / 360
-      : (value + 180) / 360;
-    document.querySelector(`#${axis.toLowerCase()}Bar`).style.width = `${Math.max(0, Math.min(100, normalized * 100))}%`;
   });
 
   document.querySelector("#estimatePosition").textContent =
-    `N ${localPosition[0].toFixed(3)} · E ${localPosition[1].toFixed(3)} · D ${localPosition[2].toFixed(3)} m`;
+    `북 ${localPosition[0].toFixed(3)} · 동 ${localPosition[1].toFixed(3)} · 하 ${localPosition[2].toFixed(3)} m`;
   document.querySelector("#estimateVelocity").textContent =
-    `N ${velocity[0].toFixed(3)} · E ${velocity[1].toFixed(3)} · D ${velocity[2].toFixed(3)} m/s`;
+    `북 ${velocity[0].toFixed(3)} · 동 ${velocity[1].toFixed(3)} · 하 ${velocity[2].toFixed(3)} m/s`;
   document.querySelector("#horizontalError").textContent =
     `${Number(estimate.horizontalError || 0).toFixed(2)} m`;
   document.querySelector("#verticalError").textContent =
@@ -387,7 +457,7 @@ function updateSensorDisplay(data) {
     && estimate.tiltAligned
     && estimate.yawAligned;
   const health = document.querySelector("#estimatorHealth");
-  health.textContent = healthy ? "EKF HEALTHY" : "CHECK ESTIMATOR";
+  health.textContent = healthy ? "EKF 정상" : "추정기 확인";
   health.classList.toggle("healthy", healthy);
   const px4Timestamp = Number(
     data.sourceTimestamps?.sensorCombined
@@ -395,8 +465,8 @@ function updateSensorDisplay(data) {
     || 0,
   );
   document.querySelector("#px4SourceTime").textContent = px4Timestamp
-    ? `PX4 TIME · ${(px4Timestamp / 1e6).toFixed(3)} s`
-    : "PX4 TIME · WAITING";
+    ? `PX4 시간 · ${(px4Timestamp / 1e6).toFixed(3)}초`
+    : "PX4 시간 · 대기 중";
 
   updateSensorAnalysis(data, healthy);
 }
@@ -479,68 +549,6 @@ function drawTimeChart(canvasId, samples) {
   });
 }
 
-function drawPositionChart() {
-  const prepared = prepareCanvas(document.querySelector("#positionChart"));
-  if (!prepared) return;
-  const { context, width, height } = prepared;
-  context.clearRect(0, 0, width, height);
-  const plot = { left: 48, right: width - 18, top: 18, bottom: height - 34 };
-  const plotWidth = plot.right - plot.left;
-  const plotHeight = plot.bottom - plot.top;
-  const allPoints = [
-    ...sensorHistory.actualPosition,
-    ...sensorHistory.desiredPosition,
-  ];
-  const extent = Math.max(
-    5,
-    ...allPoints.flat().map((value) => Math.abs(value)),
-  );
-  const project = ([north, east]) => [
-    plot.left + plotWidth / 2 + (east / extent) * plotWidth * 0.46,
-    plot.top + plotHeight / 2 - (north / extent) * plotHeight * 0.46,
-  ];
-
-  context.strokeStyle = "#343b45";
-  context.lineWidth = 1;
-  context.beginPath();
-  context.moveTo(plot.left + plotWidth / 2, plot.top);
-  context.lineTo(plot.left + plotWidth / 2, plot.bottom);
-  context.moveTo(plot.left, plot.top + plotHeight / 2);
-  context.lineTo(plot.right, plot.top + plotHeight / 2);
-  context.stroke();
-  context.fillStyle = "#a0a0a0";
-  context.font = "10px Consolas, monospace";
-  context.fillText(`N +${extent.toFixed(0)}m`, plot.left, plot.top - 5);
-  context.fillText(`N -${extent.toFixed(0)}m`, plot.left, plot.bottom + 15);
-  context.textAlign = "right";
-  context.fillText(`E +${extent.toFixed(0)}m`, plot.right, plot.bottom + 15);
-  context.textAlign = "left";
-
-  [
-    [sensorHistory.desiredPosition, "#d7ba7d", [5, 4]],
-    [sensorHistory.actualPosition, "#4daafc", []],
-  ].forEach(([points, color, dash]) => {
-    if (points.length < 2) return;
-    context.beginPath();
-    context.strokeStyle = color;
-    context.lineWidth = 2;
-    context.setLineDash(dash);
-    points.forEach((point, index) => {
-      const [x, y] = project(point);
-      if (index === 0) context.moveTo(x, y);
-      else context.lineTo(x, y);
-    });
-    context.stroke();
-    const [lastX, lastY] = project(points[points.length - 1]);
-    context.setLineDash([]);
-    context.beginPath();
-    context.fillStyle = color;
-    context.arc(lastX, lastY, 4, 0, Math.PI * 2);
-    context.fill();
-  });
-  context.setLineDash([]);
-}
-
 function globalToMeters(position, origin) {
   const earthRadius = 6378137;
   const latitudeRadians = origin[0] * Math.PI / 180;
@@ -571,7 +579,7 @@ function drawGpsEstimateChart() {
   ));
   const allMeters = [...rawMeters, ...ekfMeters];
   const extent = Math.max(
-    0.5,
+    2,
     ...allMeters.flat().map((value) => Math.abs(value)),
   );
   const plot = { left: 48, right: width - 18, top: 18, bottom: height - 34 };
@@ -641,8 +649,8 @@ function appendEstimatorLog(data, healthy, trackingError) {
   row.innerHTML = `
     <time>${time}</time>
     <span>${data.flightMode}</span>
-    <strong>${healthy ? "EKF OK" : "EKF CHECK"}</strong>
-    <code>${Number.isFinite(trackingError) ? `POS Δ ${trackingError.toFixed(2)} m` : "NO SETPOINT"}</code>
+    <strong>${healthy ? "EKF 정상" : "EKF 확인"}</strong>
+    <code>${Number.isFinite(trackingError) ? `위치 Δ ${trackingError.toFixed(2)} m` : "목표 없음"}</code>
   `;
   log.prepend(row);
   while (log.children.length > 40) log.lastElementChild.remove();
@@ -664,18 +672,6 @@ function updateSensorAnalysis(data, healthy) {
 
   pushLimited(sensorHistory.accel, sensor.accelerometer || [0, 0, 0]);
   pushLimited(sensorHistory.gyro, sensor.gyroscope || [0, 0, 0]);
-  pushTrackPoint(
-    sensorHistory.actualPosition,
-    [actual[0], actual[1]],
-    0.02,
-  );
-  if (setpoint.valid) {
-    pushTrackPoint(
-      sensorHistory.desiredPosition,
-      [desired[0], desired[1]],
-      0.02,
-    );
-  }
   if (rawGpsValid) {
     pushTrackPoint(
       sensorHistory.rawGpsPosition,
@@ -698,10 +694,6 @@ function updateSensorAnalysis(data, healthy) {
         Number(actual[2]) - Number(desired[2]),
       )
     : Number.NaN;
-  document.querySelector("#trackingError").textContent = Number.isFinite(trackingError)
-    ? `ERROR ${trackingError.toFixed(2)} m`
-    : "ERROR —";
-
   const gpsEstimateSeparation = rawGpsValid && globalEstimateValid
     ? Math.hypot(
         ...globalToMeters(
@@ -712,8 +704,8 @@ function updateSensorAnalysis(data, healthy) {
     : Number.NaN;
   document.querySelector("#gpsEstimateError").textContent =
     Number.isFinite(gpsEstimateSeparation)
-      ? `SEPARATION ${gpsEstimateSeparation.toFixed(2)} m`
-      : "SEPARATION —";
+      ? `거리 ${gpsEstimateSeparation.toFixed(2)} m`
+      : "거리 —";
   document.querySelector("#rawGpsPosition").textContent = rawGpsValid
     ? `${gpsPosition.latitude.toFixed(7)}, ${gpsPosition.longitude.toFixed(7)} · ${Number(gpsPosition.altitude).toFixed(2)}m`
     : "—";
@@ -723,7 +715,6 @@ function updateSensorAnalysis(data, healthy) {
 
   drawTimeChart("accelChart", sensorHistory.accel);
   drawTimeChart("gyroChart", sensorHistory.gyro);
-  drawPositionChart();
   drawGpsEstimateChart();
   appendEstimatorLog(data, healthy, trackingError);
 }
@@ -800,8 +791,8 @@ function renderMissionMap(data) {
   }
 
   document.querySelector("#mapLabel").textContent = missionPoints.length
-    ? `QGC MISSION · ${missionPoints.length} WAYPOINTS`
-    : "QGC LINKED · NO ACTIVE MISSION";
+    ? `QGC 미션 · 경유점 ${missionPoints.length}개`
+    : "QGC 연결됨 · 활성 미션 없음";
 }
 
 function initializeActualMap() {
@@ -832,6 +823,34 @@ function initializeActualMap() {
 
 function renderActualMap(missionPoints, data, vehicleValid) {
   if (!qgcMap) return;
+
+  const reference = data.estimate?.referencePosition;
+  const tray = data.simulation?.trayPosition;
+  if (
+    !qgcTrayMarker
+    && Array.isArray(reference)
+    && Array.isArray(tray)
+    && Number.isFinite(reference[0])
+    && Number.isFinite(reference[1])
+  ) {
+    const earthRadius = 6378137;
+    const trayPosition = [
+      reference[0] + (tray[0] / earthRadius) * (180 / Math.PI),
+      reference[1]
+        + (tray[1] / (
+          earthRadius * Math.cos(reference[0] * Math.PI / 180)
+        )) * (180 / Math.PI),
+    ];
+    qgcTrayMarker = L.marker(trayPosition, {
+      icon: L.divIcon({
+        className: "",
+        html: '<div class="tray-map-marker"><i></i></div>',
+        iconSize: [28, 22],
+        iconAnchor: [14, 11],
+      }),
+      zIndexOffset: 900,
+    }).addTo(qgcMap).bindTooltip("생존자 트레이 · 착륙 지점");
+  }
 
   if (vehicleValid) {
     const vehiclePosition = [data.latitude, data.longitude];
@@ -924,8 +943,8 @@ function updateCameraStatus(connected) {
     connected,
   );
   document.querySelector("#cameraMeta").textContent = connected
-    ? "GZ CAM · LIVE"
-    : "SIM · WAITING";
+    ? "Gazebo 하향 카메라 · YOLO 트레이 탐지"
+    : "시뮬레이션 · 대기 중";
 }
 
 /*
