@@ -19,6 +19,8 @@ const koreanFontAssets = path.join(
   "@fontsource",
   "noto-sans-kr",
 );
+const jetsonGcsUrl = (process.env.JETSON_GCS_URL || "").replace(/\/+$/, "");
+const jetsonGcsToken = process.env.JETSON_GCS_TOKEN || "";
 
 const contentTypes = {
   ".css": "text/css; charset=utf-8",
@@ -46,6 +48,8 @@ let qgcCaptureBusy = false;
 let qgcCaptureReady = false;
 let qgcCaptureSourcesLogged = false;
 let lastTelemetry;
+let jetsonPollTimer;
+let jetsonRequestActive = false;
 
 function resolveRequestPath(requestUrl) {
   const url = new URL(requestUrl, "http://127.0.0.1");
@@ -264,6 +268,54 @@ function broadcast(channel, payload) {
   BrowserWindow.getAllWindows().forEach((window) => {
     window.webContents.send(channel, payload);
   });
+}
+
+async function jetsonRequest(requestPath, options = {}) {
+  const headers = {
+    Accept: "application/json",
+    ...(options.body ? { "Content-Type": "application/json" } : {}),
+    ...(jetsonGcsToken
+      ? { Authorization: `Bearer ${jetsonGcsToken}` }
+      : {}),
+  };
+  const response = await fetch(`${jetsonGcsUrl}${requestPath}`, {
+    ...options,
+    headers: {
+      ...headers,
+      ...(options.headers || {}),
+    },
+    signal: AbortSignal.timeout(options.timeout || 5000),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || `Jetson HTTP ${response.status}`);
+  }
+  return payload;
+}
+
+function startJetsonTelemetry() {
+  if (!jetsonGcsUrl || jetsonPollTimer) return;
+
+  const poll = async () => {
+    if (jetsonRequestActive) return;
+    jetsonRequestActive = true;
+    try {
+      const telemetry = await jetsonRequest("/status", { timeout: 1500 });
+      lastTelemetry = telemetry;
+      broadcast("px4:telemetry", telemetry);
+    } catch (error) {
+      broadcast("px4:telemetry", {
+        type: "telemetry",
+        connected: false,
+        gatewayError: error.message,
+      });
+    } finally {
+      jetsonRequestActive = false;
+    }
+  };
+
+  poll();
+  jetsonPollTimer = setInterval(poll, 250);
 }
 
 function startCameraBridge() {
@@ -528,6 +580,28 @@ function saveTrayLandingPlan(plan, target) {
 }
 
 function runMissionAdapter(action, planPath) {
+  if (jetsonGcsUrl) {
+    return fs.promises.readFile(planPath, "utf8")
+      .then((encodedPlan) => jetsonRequest(
+        `/mission/${action}`,
+        {
+          method: "POST",
+          body: JSON.stringify({ plan: JSON.parse(encodedPlan) }),
+          timeout: action === "inspect" ? 10000 : 125000,
+        },
+      ))
+      .then((response) => {
+        if (response.result) {
+          broadcast("mission:status", response.result);
+        }
+        return response;
+      })
+      .catch((error) => ({
+        ok: false,
+        error: error.message,
+      }));
+  }
+
   return new Promise((resolve) => {
     if (missionProcess) {
       resolve({
@@ -681,6 +755,19 @@ ipcMain.handle("mission:start", () => {
 });
 
 ipcMain.on("px4:command", (_event, command) => {
+  if (jetsonGcsUrl) {
+    jetsonRequest(
+      "/command",
+      {
+        method: "POST",
+        body: JSON.stringify({ command }),
+      },
+    ).catch((error) => {
+      console.error(`[Jetson command] ${error.message}`);
+    });
+    return;
+  }
+
   if (rosBridge?.stdin.writable) {
     rosBridge.stdin.write(`${JSON.stringify(command)}\n`);
   }
@@ -688,9 +775,14 @@ ipcMain.on("px4:command", (_event, command) => {
 
 app.whenReady().then(async () => {
   const baseUrl = await startServer();
-  startRosBridge();
-  startMavros();
-  startCameraBridge();
+  if (jetsonGcsUrl) {
+    console.log(`[Jetson gateway] Remote mode: ${jetsonGcsUrl}`);
+    startJetsonTelemetry();
+  } else {
+    startRosBridge();
+    startMavros();
+    startCameraBridge();
+  }
   createWindow(baseUrl);
   setTimeout(launchQGroundControl, 1500);
   startQgcCapture();
@@ -717,5 +809,8 @@ app.on("before-quit", () => {
   missionProcess?.kill("SIGTERM");
   if (qgcCaptureTimer) {
     clearInterval(qgcCaptureTimer);
+  }
+  if (jetsonPollTimer) {
+    clearInterval(jetsonPollTimer);
   }
 });

@@ -405,6 +405,7 @@ function updateSitlTelemetry(data) {
 function updateSensorDisplay(data) {
   const sensor = data.sensor || {};
   const estimate = data.estimate || {};
+  const missionControl = data.missionControl || {};
   const accelerometer = sensor.accelerometer || [0, 0, 0];
   const gyroscope = sensor.gyroscope || [0, 0, 0];
   const localPosition = estimate.localPosition || [0, 0, 0];
@@ -467,6 +468,23 @@ function updateSensorDisplay(data) {
   document.querySelector("#px4SourceTime").textContent = px4Timestamp
     ? `PX4 시간 · ${(px4Timestamp / 1e6).toFixed(3)}초`
     : "PX4 시간 · 대기 중";
+  const targetOffset = missionControl.targetOffset || [];
+  const targetDistance = Number.isFinite(targetOffset[0])
+    && Number.isFinite(targetOffset[1])
+    ? Math.hypot(targetOffset[0], targetOffset[1])
+    : Number.NaN;
+  const yawError = missionControl.yawErrorDegrees;
+  const missionDetails = [
+    missionControl.state || "대기 중",
+    Number.isFinite(targetDistance)
+      ? `표적 ${targetDistance.toFixed(2)}m`
+      : null,
+    Number.isFinite(yawError)
+      ? `Yaw ${yawError.toFixed(1)}°`
+      : null,
+  ].filter(Boolean);
+  document.querySelector("#missionControlStatus").textContent =
+    `Jetson 미션 · ${missionDetails.join(" · ")}`;
 
   updateSensorAnalysis(data, healthy);
 }
